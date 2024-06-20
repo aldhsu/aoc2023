@@ -1,11 +1,12 @@
 use std::{
     array,
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     str::FromStr,
 };
 
-use anyhow::{anyhow, Context, Error, Result};
+use anyhow::anyhow;
+use anyhow::{Context, Error, Result};
 
 fn main() -> Result<()> {
     let input = include_str!("../input.txt");
@@ -13,7 +14,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, PartialOrd, Ord, Default)]
 struct Coord(usize, usize);
 
 impl Coord {
@@ -41,9 +42,15 @@ impl Coord {
     }
 }
 
+#[derive(Eq, Debug, PartialEq)]
+struct Node {
+    distance: usize,
+    cost: i32,
+}
+
 #[derive(Eq, PartialEq)]
 struct Map {
-    inner: HashMap<Coord, usize>,
+    inner: HashMap<Coord, Node>,
     width: usize,
     height: usize,
 }
@@ -52,6 +59,13 @@ impl FromStr for Map {
     type Err = Error;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let width = s
+            .lines()
+            .next()
+            .map(|line| line.chars().count())
+            .context("couldn't get width")?;
+        let height = s.lines().count();
+
         let inner = s
             .lines()
             .enumerate()
@@ -59,17 +73,14 @@ impl FromStr for Map {
                 line.chars().enumerate().map(move |(x, c)| {
                     (
                         Coord(x, y),
-                        c.to_digit(10).expect("couldn't get digit") as usize,
+                        Node {
+                            distance: width - x + height - y,
+                            cost: c.to_digit(10).expect("couldn't get digit") as i32,
+                        },
                     )
                 })
             })
             .collect();
-        let width = s
-            .lines()
-            .next()
-            .map(|line| line.chars().count())
-            .context("couldn't get width")?;
-        let height = s.lines().count();
 
         Ok(Self {
             inner,
@@ -80,8 +91,105 @@ impl FromStr for Map {
 }
 
 impl Map {
-    fn get(&self, coord: &Coord) -> Option<&usize> {
+    fn get(&self, coord: &Coord) -> Option<&Node> {
         self.inner.get(coord)
+    }
+
+    fn node_cost(&self, coord: &Coord) -> Option<i32> {
+        self.get(coord).and_then(|node| Some(node.cost))
+    }
+
+    fn path(&self) -> Result<Vec<Coord>> {
+        fn reconstruct_path(came_from: &HashMap<Coord, Coord>, mut current: Coord) -> Vec<Coord> {
+            let mut total_path = vec![current];
+            while let Some(previous) = came_from.get(&current) {
+                current = *previous;
+                total_path.push(*previous);
+            }
+
+            total_path
+        }
+
+        let finish = Coord(self.width - 1, self.height - 1);
+        let mut open_set: BinaryHeap<Reverse<State>> =
+            BinaryHeap::from([Reverse(State::default())]);
+        let mut came_from: HashMap<Coord, Coord> = HashMap::new();
+
+        let mut g_scores = HashMap::new();
+        g_scores.insert(Coord::default(), 0);
+
+        let mut f_score = HashMap::new();
+
+        while let Some(Reverse(state)) = open_set.pop() {
+            if state.head == finish {
+                return Ok(reconstruct_path(&came_from, state.head));
+            }
+
+            // neighbors need to be filtered for not going back the way they came
+            for neighbor in state.head.neighbors().into_iter() {
+                let Some((neighbor, dir)) = neighbor else {
+                    continue;
+                };
+                if state.dir.is_opposite(&dir) {
+                    continue;
+                }
+
+                if state.steps == 3 && state.dir == dir {
+                    continue;
+                }
+
+                let Some(neighbor_cost) = self.node_cost(&neighbor) else {
+                    continue;
+                }; // neighbor doesn't exist;
+
+                let g_score = g_scores.get(&state.head).unwrap_or(&i32::MAX);
+                let tentative_g_score = g_score + neighbor_cost;
+
+                let neighbor_g_score = g_scores.get(&neighbor).unwrap_or(&i32::MAX);
+                if &tentative_g_score < neighbor_g_score {
+                    let node_cost = self.node_cost(&neighbor).expect("couldn't get node cost");
+                    came_from.insert(neighbor, state.head);
+                    g_scores.insert(neighbor, tentative_g_score);
+                    f_score.insert(neighbor, tentative_g_score + node_cost as i32);
+                    let next_state = State {
+                        heat_loss: node_cost,
+                        head: neighbor,
+                        steps: if dir == state.dir { state.steps + 1 } else { 1 },
+                        dir,
+                    };
+
+                    open_set.push(Reverse(next_state))
+                }
+            }
+        }
+
+        Err(anyhow!("couldn't get a path"))
+    }
+
+    fn solve(&self) -> Result<i32> {
+        let path = self.path()?;
+        self.print_path(&path);
+        Ok(path.into_iter().map(|coord| self.inner[&coord].cost).sum())
+    }
+
+    fn print_path(&self, path: &[Coord]) {
+        let mut hash: HashMap<&usize, HashSet<usize>> = HashMap::new();
+        path.iter().for_each(|Coord(x, y)| {
+            hash.entry(y).or_default().insert(*x);
+        });
+
+        for y in 0..self.height {
+            let mut string = String::new();
+            for x in 0..self.width {
+                let char = match hash.get(&y).expect("couldn't get y").get(&x) {
+                    Some(_) => '*',
+                    None => '.',
+                };
+                string.push(char);
+            }
+
+            println!("{}", string);
+        }
     }
 }
 
@@ -99,125 +207,70 @@ enum Dir {
     West,
 }
 
-#[derive(Eq, PartialEq, Clone)]
-struct State<'a> {
-    heat_loss: usize,
+#[derive(Eq, PartialEq)]
+enum Plane {
+    Horizontal,
+    Vertical,
+}
+
+impl Dir {
+    fn plane(&self) -> Plane {
+        match self {
+            Dir::North => Plane::Vertical,
+            Dir::South => Plane::Vertical,
+            Dir::East => Plane::Horizontal,
+            Dir::West => Plane::Horizontal,
+        }
+    }
+    fn is_aligned(&self, other: &Self) -> bool {
+        self.plane() == other.plane()
+    }
+    fn is_opposite(&self, other: &Self) -> bool {
+        if self == other {
+            return false;
+        }
+        if !self.is_aligned(other) {
+            return false;
+        }
+        true
+    }
+}
+
+#[derive(Eq, PartialEq, Clone, Hash)]
+struct State {
+    heat_loss: i32,
     head: Coord,
-    dir_list: [Option<Dir>; 3],
-    map: &'a Map,
+    steps: u8,
+    dir: Dir,
 }
 
-impl<'a> Ord for State<'a> {
+impl Ord for State {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.heat_loss.cmp(&other.heat_loss)
+        other.heat_loss.cmp(&self.heat_loss)
     }
 }
 
-impl<'a> PartialOrd for State<'a> {
+impl PartialOrd for State {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.heat_loss.partial_cmp(&other.heat_loss)
+        Some(other.cmp(self))
     }
 }
 
-type Work<'a> = BinaryHeap<Reverse<State<'a>>>;
-type DirList = [Option<Dir>; 3];
-
-impl<'a> State<'a> {
-    fn new(map: &'a Map) -> Self {
+impl Default for State {
+    fn default() -> Self {
         Self {
             head: Coord(0, 0),
-            dir_list: [None; 3],
             heat_loss: 0,
-            map,
+            steps: 0,
+            dir: Dir::North,
         }
-    }
-
-    fn solve(&'a self) -> Result<usize> {
-        // visited hash with lowest values
-        // path finding minheap
-        let mut work: Work<'a> = BinaryHeap::from([Reverse(self.clone())]);
-        let mut visited: HashMap<(Coord, DirList), usize> = HashMap::new();
-
-        fn add_work<'a>(
-            state: State<'a>,
-            work: &'_ mut Work<'a>,
-            visited: &'_ mut HashMap<(Coord, DirList), usize>,
-            map: &Map,
-        ) {
-            for opt in state.head.neighbors().into_iter() {
-                match opt {
-                    Some((coord, dir)) => {
-                        let Some(heat_loss) = state.map.get(&coord) else {
-                            continue;
-                        };
-
-                        let total_heat_loss = state.heat_loss + heat_loss;
-                        // if let Some(exit) = visited.get(&(coord, dir)) {
-                        //     if &total_heat_loss > exit {
-                        //         continue;
-                        //     }
-                        // }
-
-                        // if let Some(previous_loss) = visited.get(&(coord, dir)) {
-                        //     if *previous_loss < total_heat_loss {
-                        //         continue;
-                        //     }
-                        // }
-                        if state.dir_list.iter().all(|prev| prev == &Some(dir)) {
-                            continue;
-                        }
-
-                        let mut new_work = State {
-                            head: coord,
-                            heat_loss: total_heat_loss,
-                            ..state
-                        };
-
-                        new_work.dir_list.rotate_left(1);
-                        new_work.dir_list.last_mut().map(|last| *last = Some(dir));
-
-                        visited.insert((coord, state.dir_list), total_heat_loss);
-                        work.push(Reverse(new_work));
-                    }
-                    None => continue,
-                }
-            }
-        }
-
-        // fn print_visited(visited: &HashMap<Coord, usize>, map: &Map) {
-        //     for y in 0..map.height {
-        //         let mut string = String::new();
-        //         for x in 0..map.width {
-        //             string.push_str(&format!("{:3}", visited.get(&Coord(x, y)).unwrap()));
-        //             string.push(' ');
-        //         }
-        //
-        //         println!("{}\n", string);
-        //     }
-        // }
-
-        while let Some(Reverse(state)) = work.pop() {
-            add_work(state, &mut work, &mut visited, self.map);
-        }
-
-        // print_visited(&visited, self.map);
-
-        let exit = Coord(self.map.width - 1, self.map.height - 1);
-
-        visited
-            .into_iter()
-            .filter(|((coord, _), _)| *coord == exit)
-            .map(|(_, val)| val)
-            .min()
-            .context("couldn't find end")
     }
 }
 
-fn part1(s: &str) -> Result<usize> {
+fn part1(s: &str) -> Result<i32> {
     let map: Map = s.parse()?;
-    let state = State::new(&map);
 
-    state.solve()
+    map.solve()
 }
 
 #[test]
