@@ -11,13 +11,14 @@ use anyhow::{Context, Error, Result};
 fn main() -> Result<()> {
     let input = include_str!("../input.txt");
     println!("part1: {}", part1(input)?);
+    println!("part2: {}", part2(input)?);
     Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, PartialOrd, Ord, Default)]
 struct Coord(usize, usize);
 
-type Neighbors<const MAX_STEP: usize>: = [Option<(Coord, usize)>; MAX_STEP];
+type Neighbors<const MAX_STEP: usize> = [Option<(Coord, usize)>; MAX_STEP];
 
 impl Coord {
     const OFFSETS: [(isize, isize, Dir); 4] = [
@@ -28,7 +29,12 @@ impl Coord {
     ];
 
     fn neighbors<const MAX_STEP: usize>(&self) -> [(Dir, Neighbors<MAX_STEP>); 4] {
-        fn make_coord(coord: &Coord, off_x: isize, off_y: isize, step: usize) -> Option<(Coord, usize)> {
+        fn make_coord(
+            coord: &Coord,
+            off_x: isize,
+            off_y: isize,
+            step: usize,
+        ) -> Option<(Coord, usize)> {
             Some((
                 Coord(
                     coord.0.checked_add_signed(off_x)?,
@@ -40,12 +46,14 @@ impl Coord {
 
         array::from_fn(|i| {
             let (off_x, off_y, dir) = Self::OFFSETS[i];
-            (dir, array::from_fn(|j| {
-                let j = j as isize + 1;
-                let off_x = off_x * j;
-                make_coord(self, off_x, off_y * j, j as usize)
-            }
-            ))
+            (
+                dir,
+                array::from_fn(|j| {
+                    let j = j as isize + 1;
+                    let off_x = off_x * j;
+                    make_coord(self, off_x, off_y * j, j as usize)
+                }),
+            )
         })
     }
 }
@@ -104,22 +112,10 @@ impl Map {
     }
 
     fn node_cost(&self, coord: &Coord) -> Option<i32> {
-        self.get(coord).and_then(|node| Some(node.cost))
+        self.get(coord).map(|node| node.cost)
     }
 
-    const MAX_STEPS: u8 = 3;
-
-    fn solve(&self) -> Result<i32> {
-        fn reconstruct_path(came_from: &HashMap<Coord, Coord>, mut current: Coord) -> Vec<Coord> {
-            let mut total_path = vec![current];
-            while let Some(previous) = came_from.get(&current) {
-                current = *previous;
-                total_path.push(*previous);
-            }
-
-            total_path
-        }
-
+    fn solve<const MIN_STEP: u8, const MAX_STEP: usize>(&self) -> Result<i32> {
         let finish = Coord(self.width - 1, self.height - 1);
         let mut open_set: BinaryHeap<Reverse<State>> =
             BinaryHeap::from([Reverse(State::default())]);
@@ -127,39 +123,37 @@ impl Map {
 
         while let Some(Reverse(state)) = open_set.pop() {
             if state.head == finish {
-                self.print_path(&state.history);
                 return Ok(state.heat_loss);
             }
 
-            for (dir, neighbors) in state.head.neighbors::<3>().into_iter() {
-                // never go in the same plane
-                // we only deal with turns
+            for (dir, neighbors) in state.head.neighbors::<MAX_STEP>().into_iter() {
                 if state.is_aligned(&Some(dir)) {
                     continue;
                 }
 
                 let mut total_cost = state.heat_loss;
-                for neighbor in dbg!(neighbors) {
+                for neighbor in neighbors {
                     let Some((neighbor, step)) = neighbor else {
-                        continue;
+                        break;
                     };
-                    let Some(mut neighbor_cost) = self.node_cost(&neighbor) else {
-                        continue;
+
+                    let Some(neighbor_cost) = self.node_cost(&neighbor) else {
+                        break;
                     }; // neighbor doesn't exist;
                     total_cost += neighbor_cost;
 
+                    if (step as u8) < MIN_STEP {
+                        continue
+                    }
+
                     let visited_key = (neighbor, dir);
 
-                    if &neighbor_cost < visited.get(&visited_key).unwrap_or(&i32::MAX) {
-                        visited.insert(visited_key, neighbor_cost);
-                        let mut history = state.history.clone();
-                        history.push(neighbor);
-
+                    if &total_cost < visited.get(&visited_key).unwrap_or(&i32::MAX) {
+                        visited.insert(visited_key, total_cost);
                         let next_state = State {
                             heat_loss: total_cost,
                             head: neighbor,
-                            steps: if Some(dir) == state.dir { state.steps + 1 } else { 1 },
-                            history,
+                            steps: step as u8,
                             dir: Some(dir),
                         };
 
@@ -196,12 +190,6 @@ impl Map {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Cursor {
-    coord: Coord,
-    dir: Dir,
-}
-
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Hash)]
 enum Dir {
     North,
@@ -227,7 +215,6 @@ impl Dir {
     }
     fn is_aligned(&self, other: &Option<Self>) -> bool {
         other.is_some_and(|other| self.plane() == other.plane())
-        
     }
 }
 
@@ -237,7 +224,6 @@ struct State {
     head: Coord,
     steps: u8,
     dir: Option<Dir>,
-    history: Vec<Coord>,
 }
 
 impl State {
@@ -267,7 +253,6 @@ impl Default for State {
             head: Coord(0, 0),
             heat_loss: 0,
             steps: 0,
-            history: Default::default(),
             dir: None,
         }
     }
@@ -276,7 +261,13 @@ impl Default for State {
 fn part1(s: &str) -> Result<i32> {
     let map: Map = s.parse()?;
 
-    map.solve()
+    map.solve::<0, 3>()
+}
+
+fn part2(s: &str) -> Result<i32> {
+    let map: Map = s.parse()?;
+
+    map.solve::<4, 10>()
 }
 
 #[test]
@@ -295,6 +286,31 @@ fn part1_test() {
 2546548887735
 4322674655533"#;
     assert_eq!(part1(input).unwrap(), 102);
+}
+
+#[test]
+fn part2_test() {
+    let input = r#"2413432311323
+3215453535623
+3255245654254
+3446585845452
+4546657867536
+1438598798454
+4457876987766
+3637877979653
+4654967986887
+4564679986453
+1224686865563
+2546548887735
+4322674655533"#;
+    assert_eq!(part2(input).unwrap(), 94);
+
+    let input = r#"111111111111
+999999999991
+999999999991
+999999999991
+999999999991"#;
+    assert_eq!(part2(input).unwrap(), 71);
 }
 
 // 2413432311323
