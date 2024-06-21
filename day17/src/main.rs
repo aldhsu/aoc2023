@@ -17,6 +17,8 @@ fn main() -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, PartialOrd, Ord, Default)]
 struct Coord(usize, usize);
 
+type Neighbors<const MAX_STEP: usize>: = [Option<(Coord, usize)>; MAX_STEP];
+
 impl Coord {
     const OFFSETS: [(isize, isize, Dir); 4] = [
         (0, -1, Dir::North),
@@ -25,19 +27,25 @@ impl Coord {
         (0, 1, Dir::South),
     ];
 
-    fn neighbors(&self) -> [Option<(Coord, Dir)>; 4] {
-        fn make_coord(coord: &Coord, off_x: isize, off_y: isize, dir: Dir) -> Option<(Coord, Dir)> {
+    fn neighbors<const MAX_STEP: usize>(&self) -> [(Dir, Neighbors<MAX_STEP>); 4] {
+        fn make_coord(coord: &Coord, off_x: isize, off_y: isize, step: usize) -> Option<(Coord, usize)> {
             Some((
                 Coord(
                     coord.0.checked_add_signed(off_x)?,
                     coord.1.checked_add_signed(off_y)?,
                 ),
-                dir,
+                step,
             ))
         }
+
         array::from_fn(|i| {
             let (off_x, off_y, dir) = Self::OFFSETS[i];
-            make_coord(self, off_x, off_y, dir)
+            (dir, array::from_fn(|j| {
+                let j = j as isize + 1;
+                let off_x = off_x * j;
+                make_coord(self, off_x, off_y * j, j as usize)
+            }
+            ))
         })
     }
 }
@@ -99,7 +107,9 @@ impl Map {
         self.get(coord).and_then(|node| Some(node.cost))
     }
 
-    fn path(&self) -> Result<Vec<Coord>> {
+    const MAX_STEPS: u8 = 3;
+
+    fn solve(&self) -> Result<i32> {
         fn reconstruct_path(came_from: &HashMap<Coord, Coord>, mut current: Coord) -> Vec<Coord> {
             let mut total_path = vec![current];
             while let Some(previous) = came_from.get(&current) {
@@ -113,63 +123,53 @@ impl Map {
         let finish = Coord(self.width - 1, self.height - 1);
         let mut open_set: BinaryHeap<Reverse<State>> =
             BinaryHeap::from([Reverse(State::default())]);
-        let mut came_from: HashMap<Coord, Coord> = HashMap::new();
-
-        let mut g_scores = HashMap::new();
-        g_scores.insert(Coord::default(), 0);
-
-        let mut f_score = HashMap::new();
+        let mut visited: HashMap<(Coord, Dir), i32> = HashMap::new();
 
         while let Some(Reverse(state)) = open_set.pop() {
             if state.head == finish {
-                return Ok(reconstruct_path(&came_from, state.head));
+                self.print_path(&state.history);
+                return Ok(state.heat_loss);
             }
 
-            // neighbors need to be filtered for not going back the way they came
-            for neighbor in state.head.neighbors().into_iter() {
-                let Some((neighbor, dir)) = neighbor else {
-                    continue;
-                };
-                if state.dir.is_opposite(&dir) {
+            for (dir, neighbors) in state.head.neighbors::<3>().into_iter() {
+                // never go in the same plane
+                // we only deal with turns
+                if state.is_aligned(&Some(dir)) {
                     continue;
                 }
 
-                if state.steps == 3 && state.dir == dir {
-                    continue;
-                }
-
-                let Some(neighbor_cost) = self.node_cost(&neighbor) else {
-                    continue;
-                }; // neighbor doesn't exist;
-
-                let g_score = g_scores.get(&state.head).unwrap_or(&i32::MAX);
-                let tentative_g_score = g_score + neighbor_cost;
-
-                let neighbor_g_score = g_scores.get(&neighbor).unwrap_or(&i32::MAX);
-                if &tentative_g_score < neighbor_g_score {
-                    let node_cost = self.node_cost(&neighbor).expect("couldn't get node cost");
-                    came_from.insert(neighbor, state.head);
-                    g_scores.insert(neighbor, tentative_g_score);
-                    f_score.insert(neighbor, tentative_g_score + node_cost as i32);
-                    let next_state = State {
-                        heat_loss: node_cost,
-                        head: neighbor,
-                        steps: if dir == state.dir { state.steps + 1 } else { 1 },
-                        dir,
+                let mut total_cost = state.heat_loss;
+                for neighbor in dbg!(neighbors) {
+                    let Some((neighbor, step)) = neighbor else {
+                        continue;
                     };
+                    let Some(mut neighbor_cost) = self.node_cost(&neighbor) else {
+                        continue;
+                    }; // neighbor doesn't exist;
+                    total_cost += neighbor_cost;
 
-                    open_set.push(Reverse(next_state))
+                    let visited_key = (neighbor, dir);
+
+                    if &neighbor_cost < visited.get(&visited_key).unwrap_or(&i32::MAX) {
+                        visited.insert(visited_key, neighbor_cost);
+                        let mut history = state.history.clone();
+                        history.push(neighbor);
+
+                        let next_state = State {
+                            heat_loss: total_cost,
+                            head: neighbor,
+                            steps: if Some(dir) == state.dir { state.steps + 1 } else { 1 },
+                            history,
+                            dir: Some(dir),
+                        };
+
+                        open_set.push(Reverse(next_state))
+                    }
                 }
             }
         }
 
         Err(anyhow!("couldn't get a path"))
-    }
-
-    fn solve(&self) -> Result<i32> {
-        let path = self.path()?;
-        self.print_path(&path);
-        Ok(path.into_iter().map(|coord| self.inner[&coord].cost).sum())
     }
 
     fn print_path(&self, path: &[Coord]) {
@@ -181,8 +181,11 @@ impl Map {
         for y in 0..self.height {
             let mut string = String::new();
             for x in 0..self.width {
-                let char = match hash.get(&y).expect("couldn't get y").get(&x) {
-                    Some(_) => '*',
+                let char = match hash.get(&y) {
+                    Some(v) => match v.get(&x) {
+                        Some(_) => '*',
+                        None => '.',
+                    },
                     None => '.',
                 };
                 string.push(char);
@@ -222,17 +225,9 @@ impl Dir {
             Dir::West => Plane::Horizontal,
         }
     }
-    fn is_aligned(&self, other: &Self) -> bool {
-        self.plane() == other.plane()
-    }
-    fn is_opposite(&self, other: &Self) -> bool {
-        if self == other {
-            return false;
-        }
-        if !self.is_aligned(other) {
-            return false;
-        }
-        true
+    fn is_aligned(&self, other: &Option<Self>) -> bool {
+        other.is_some_and(|other| self.plane() == other.plane())
+        
     }
 }
 
@@ -241,18 +236,28 @@ struct State {
     heat_loss: i32,
     head: Coord,
     steps: u8,
-    dir: Dir,
+    dir: Option<Dir>,
+    history: Vec<Coord>,
+}
+
+impl State {
+    fn is_aligned(&self, other: &Option<Dir>) -> bool {
+        match self.dir {
+            Some(dir) => dir.is_aligned(other),
+            None => false,
+        }
+    }
 }
 
 impl Ord for State {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.heat_loss.cmp(&self.heat_loss)
+        self.heat_loss.cmp(&other.heat_loss)
     }
 }
 
 impl PartialOrd for State {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(other.cmp(self))
+        Some(self.cmp(other))
     }
 }
 
@@ -262,7 +267,8 @@ impl Default for State {
             head: Coord(0, 0),
             heat_loss: 0,
             steps: 0,
-            dir: Dir::North,
+            history: Default::default(),
+            dir: None,
         }
     }
 }
@@ -332,6 +338,20 @@ fn part1_test() {
 // 12246868655<v
 // 25465488877v5
 // 43226746555v>
+//
+// 0..*..*..*....
+// 1..*..*.......
+// 2.............
+// 3........*.*..
+// 4.............
+// 5.............
+// 6..........**.
+// 7.............
+// 8.............
+// 9...........**
+// 0.............
+// 1.............
+// 2............*
 //
 //  5   4   5          23
 //
