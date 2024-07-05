@@ -1,6 +1,3 @@
-#![feature(fn_traits)]
-use std::cmp::Ordering;
-
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::alpha1;
@@ -11,57 +8,7 @@ use nom::sequence::separated_pair;
 use nom::sequence::tuple;
 use nom::IResult;
 
-pub struct Rule {
-    pub name: String,
-    conditions: Vec<Cond>,
-}
-
-impl Rule {
-    pub fn apply<'a>(&self, xmas: &Xmas) -> &Outcome {
-        for cond in &self.conditions {
-            if let Some(ref val) = cond.apply(&xmas) {
-                return val;
-            }
-        }
-        unreachable!()
-    }
-}
-
-#[derive(Debug, Eq, PartialEq, Default)]
-pub enum Outcome {
-    Target(String),
-    #[default]
-    Accepted,
-    Rejected,
-}
-
-pub struct Cond {
-    condition: Box<dyn Fn(&Xmas) -> bool>,
-    target: Outcome,
-}
-
-impl Cond {
-    fn apply(&self, xmas: &Xmas) -> Option<&Outcome> {
-        if !(self.condition)(xmas) {
-            return None;
-        }
-        Some(&self.target)
-    }
-}
-
-#[derive(Debug, Eq, PartialEq, Default)]
-pub struct Xmas {
-    x: isize,
-    m: isize,
-    a: isize,
-    s: isize,
-}
-
-impl Xmas {
-    pub fn total(&self) -> isize {
-        self.x + self.m + self.a + self.s
-    }
-}
+use crate::models::{Rule, CondType, Outcome, Xmas, Operator, FieldName};
 
 #[test]
 fn parsing_rule_works() {
@@ -94,6 +41,7 @@ fn parsing_rule_works() {
 pub fn parse_xmases(s: &str) -> IResult<&str, Vec<Xmas>> {
     separated_list1(tag("\n"), parse_xmas)(s)
 }
+
 #[test]
 fn can_parse_xmas() {
     let input = r#"{x=787,m=2655,a=1222,s=2876}
@@ -155,7 +103,7 @@ fn parse_rule(s: &str) -> IResult<&str, Rule> {
     Ok((s, rule))
 }
 
-fn parse_conds(s: &str) -> IResult<&str, Vec<Cond>> {
+fn parse_conds(s: &str) -> IResult<&str, Vec<CondType>> {
     separated_list1(tag(","), parse_cond)(s)
 }
 #[test]
@@ -164,7 +112,7 @@ fn parse_conds_works() {
     assert_eq!(conds.len(), 2)
 }
 
-fn parse_cond(s: &str) -> IResult<&str, Cond> {
+fn parse_cond(s: &str) -> IResult<&str, CondType> {
     // a<2006:qkq
     // m>2090:A
     // rfg
@@ -189,15 +137,12 @@ fn parse_outcome_works() {
     )
 }
 
-fn parse_no_cond(s: &str) -> IResult<&str, Cond> {
+fn parse_no_cond(s: &str) -> IResult<&str, CondType> {
     let (s, outcome) = parse_outcome(s)?;
 
     Ok((
         s,
-        Cond {
-            condition: Box::new(|_| true),
-            target: outcome,
-        },
+        CondType::Unconditional(outcome),
     ))
 }
 #[test]
@@ -207,7 +152,7 @@ fn parse_no_cond_works() {
     assert_eq!(cond.apply(&xmas), Some(&Outcome::Target("rfg".into())))
 }
 
-fn parse_full_cond(s: &str) -> IResult<&str, Cond> {
+fn parse_full_cond(s: &str) -> IResult<&str, CondType> {
     // a<2006:qkq
     // m>2090:A
     let (s, (field, operator, comparator, _, target)) = tuple((
@@ -219,23 +164,25 @@ fn parse_full_cond(s: &str) -> IResult<&str, Cond> {
     ))(s)?;
 
     let comparator = comparator.parse::<isize>().unwrap();
-    let value = match field {
-        "x" => |xmas: &Xmas| xmas.x,
-        "m" => |xmas: &Xmas| xmas.m,
-        "a" => |xmas: &Xmas| xmas.a,
-        "s" => |xmas: &Xmas| xmas.s,
+    let field_name = match field {
+        "x" => FieldName::X,
+        "m" => FieldName::M,
+        "a" => FieldName::A,
+        "s" => FieldName::S,
         _ => unreachable!(),
     };
 
-    let ordering = match operator {
-        ">" => Ordering::Greater,
-        "<" => Ordering::Less,
+    let operator = match operator {
+        ">" => Operator::Greater,
+        "<" => Operator::Lesser,
         _ => unreachable!(),
     };
 
-    let cond = Cond {
-        condition: Box::new(move |xmas| value(xmas).cmp(&comparator) == ordering),
+    let cond = CondType::Cond{
         target,
+        operator,
+        comparator,
+        field_name,
     };
 
     Ok((s, cond))
